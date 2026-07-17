@@ -1,12 +1,13 @@
 --[[
 	ryshub/music — compact, draggable music player for Roblox.
-	Downloads its track list (tracks.lua) from the repo, plays audio IDs,
-	and persists favorites to ryshub/music/favorites.json.
+	Components (downloaded from the repo):
+	  lib.lua    — shared UI / input / HTTP / icon helpers
+	  tracks.lua — the song list
+	Favorites persist to ryshub/music/favorites.json.
 ]]
 
 local Players = game:GetService("Players")
 local SoundService = game:GetService("SoundService")
-local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
@@ -21,14 +22,14 @@ end
 
 -- ================= Constants =================
 
-local TRACKS_URL = "https://raw.githubusercontent.com/Ryshub/music/main/tracks.lua"
+local REPO_URL = "https://raw.githubusercontent.com/Ryshub/music/main/"
+local LIB_URL = REPO_URL .. "lib.lua"
+local TRACKS_URL = REPO_URL .. "tracks.lua"
 local ICONS_URL = "https://raw.githubusercontent.com/Footagesus/Icons/main/Main-v2.lua"
 local ICON_PACK = "sfsymbols"
 
 local SAVE_DIR = "ryshub/music"
 local FAV_FILE = SAVE_DIR .. "/favorites.json"
-
-local TAP_THRESHOLD = 6 -- px of movement before a press counts as a drag
 
 local COLORS = {
 	bar = Color3.fromRGB(16, 16, 18),
@@ -41,28 +42,10 @@ local COLORS = {
 	accent = Color3.fromRGB(150, 110, 255),
 }
 
--- ================= Generic helpers =================
+-- ================= Lib bootstrap =================
 
--- Service connections that live outside the UI tree: tracked so they can be
--- disconnected on re-run (UI-tree connections die with the ScreenGui).
-local uiConnections = {}
-local function trackConn(conn)
-	table.insert(uiConnections, conn)
-	return conn
-end
-
-local function isPress(input)
-	return input.UserInputType == Enum.UserInputType.MouseButton1
-		or input.UserInputType == Enum.UserInputType.Touch
-end
-
-local function isMove(input)
-	return input.UserInputType == Enum.UserInputType.MouseMovement
-		or input.UserInputType == Enum.UserInputType.Touch
-end
-
--- Fetches a URL trying every HTTP API the executor may expose.
-local function fetch(url)
+-- Minimal fetch just to download lib.lua; everything else uses Lib.fetch*.
+local function bootstrapFetch(url)
 	for _, getter in ipairs({ game.HttpGetAsync, game.HttpGet }) do
 		local ok, res = pcall(getter, game, url)
 		if ok and type(res) == "string" and res ~= "" then
@@ -75,54 +58,33 @@ local function fetch(url)
 	return ok and res or nil
 end
 
--- Downloads and executes a Lua module, returning its result (or nil).
-local function fetchModule(url)
-	local src = fetch(url)
-	if not src then
-		return nil
-	end
-	local ok, result = pcall(function()
-		return loadstring(src)()
-	end)
-	return ok and result or nil
-end
-
--- Declarative Instance builder; `Parent` is applied last.
-local function create(className, props)
-	local inst = Instance.new(className)
-	for key, value in pairs(props) do
-		if key ~= "Parent" then
-			inst[key] = value
+local Lib
+do
+	local src = bootstrapFetch(LIB_URL)
+	if src then
+		local ok, mod = pcall(function()
+			return loadstring(src)()
+		end)
+		if ok and type(mod) == "table" then
+			Lib = mod
 		end
 	end
-	inst.Parent = props.Parent
-	return inst
+end
+if not Lib then
+	warn("[music] could not load lib.lua — aborting")
+	return
 end
 
-local function corner(parent, radiusPx)
-	return create("UICorner", {
-		CornerRadius = radiusPx and UDim.new(0, radiusPx) or UDim.new(1, 0),
-		Parent = parent,
-	})
-end
-
-local function padding(parent, top, bottom, left, right)
-	return create("UIPadding", {
-		PaddingTop = UDim.new(0, top or 0),
-		PaddingBottom = UDim.new(0, bottom or 0),
-		PaddingLeft = UDim.new(0, left or 0),
-		PaddingRight = UDim.new(0, right or 0),
-		Parent = parent,
-	})
-end
+local create, corner, padding = Lib.create, Lib.corner, Lib.padding
+local createIcon = Lib.icons.createIcon
+Lib.icons.configure(ICONS_URL, ICON_PACK)
 
 -- ================= Track data =================
 
--- Tracks live in tracks.lua (separate component) and are downloaded from the
--- repo. On failure a minimal fallback keeps the UI working.
+-- Tracks live in tracks.lua; on failure a minimal fallback keeps the UI working.
 local musicTracks = {}
 do
-	local raw = fetchModule(TRACKS_URL)
+	local raw = Lib.fetchModule(TRACKS_URL)
 	if type(raw) == "table" then
 		for _, t in ipairs(raw) do
 			if type(t) == "table" and type(t.id) == "string" and t.id ~= "" then
@@ -211,206 +173,6 @@ local function toggleFavorite(id)
 	saveFavorites()
 end
 
--- ================= Icons =================
-
--- Icon loader: downloads Footagesus' icon module and caches it (shared with
--- other scripts through _G.Lucide). Uses the "sfsymbols" pack (filled
--- variants); on failure every icon falls back to a text glyph.
-local LucideModule = nil
-
-local function getLucide()
-	if LucideModule then
-		return LucideModule
-	end
-	if type(_G) == "table" and _G.Lucide then
-		LucideModule = _G.Lucide
-		return LucideModule
-	end
-	local mod = fetchModule(ICONS_URL)
-	if mod then
-		LucideModule = mod
-		_G.Lucide = mod
-	end
-	return LucideModule
-end
-
--- Resolves an icon to { Image, ImageRectOffset, ImageRectSize } or nil.
--- Always requests the explicit pack so it doesn't depend on the default type
--- another script might have set.
-local function readIconAsset(name)
-	local lucide = getLucide()
-	if not lucide or not name then
-		return nil
-	end
-
-	local data
-	for _, fnName in ipairs({ "Icon2", "Icon" }) do
-		if type(lucide[fnName]) == "function" then
-			local ok, res = pcall(lucide[fnName], name, ICON_PACK, true)
-			if ok and res then
-				data = res
-				break
-			end
-		end
-	end
-
-	if type(data) == "string" then
-		return { Image = data, ImageRectOffset = Vector2.zero, ImageRectSize = Vector2.zero }
-	elseif type(data) == "table" and data[1] and data[2] then
-		local image = data[1]
-		if type(image) == "number" then
-			image = "rbxassetid://" .. tostring(image)
-		end
-		return {
-			Image = image,
-			ImageRectOffset = data[2].ImageRectPosition or data[2].ImageRectOffset or Vector2.zero,
-			ImageRectSize = data[2].ImageRectSize or Vector2.zero,
-		}
-	end
-
-	local set = lucide.Icons and lucide.Icons[ICON_PACK]
-	local entry = set and set.Icons and set.Icons[name]
-	if entry then
-		local image = (set.Spritesheets and set.Spritesheets[tostring(entry.Image)]) or entry.Image
-		if type(image) == "number" then
-			image = "rbxassetid://" .. tostring(image)
-		end
-		return {
-			Image = image,
-			ImageRectOffset = entry.ImageRectPosition or entry.ImageRectOffset or Vector2.zero,
-			ImageRectSize = entry.ImageRectSize or Vector2.zero,
-		}
-	end
-
-	return nil
-end
-
-local function applyIcon(imageObject, name)
-	local asset = readIconAsset(name)
-	if not asset or type(asset.Image) ~= "string" or asset.Image == "" then
-		imageObject.Image = ""
-		return false
-	end
-	imageObject.Image = asset.Image
-	if typeof(asset.ImageRectOffset) == "Vector2" then
-		imageObject.ImageRectOffset = asset.ImageRectOffset
-	end
-	if typeof(asset.ImageRectSize) == "Vector2" then
-		imageObject.ImageRectSize = asset.ImageRectSize
-	end
-	return true
-end
-
--- Icon display (image + text fallback) centered in `parent`.
--- `set(name, glyph)` swaps the icon, `tint(color)` recolors both layers.
-local function createIcon(parent, size, color, fallbackTextSize)
-	local img = create("ImageLabel", {
-		Name = "Icon",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.5, 0),
-		Size = UDim2.fromOffset(size, size),
-		BackgroundTransparency = 1,
-		ImageColor3 = color,
-		Parent = parent,
-	})
-	local fb = create("TextLabel", {
-		Name = "Fallback",
-		Size = UDim2.new(1, 0, 1, 0),
-		BackgroundTransparency = 1,
-		Text = "",
-		TextColor3 = color,
-		Font = Enum.Font.GothamBold,
-		TextSize = fallbackTextSize or math.floor(size * 0.9),
-		Visible = false,
-		Parent = parent,
-	})
-
-	local ctl = {}
-	function ctl.set(iconName, glyph)
-		if glyph then
-			fb.Text = glyph
-		end
-		local ok = applyIcon(img, iconName)
-		img.Visible = ok
-		fb.Visible = not ok
-	end
-	function ctl.tint(c)
-		img.ImageColor3 = c
-		fb.TextColor3 = c
-	end
-	return ctl
-end
-
--- ================= Input helpers =================
-
--- Makes `target` follow pointer drags that start on `handle`. If `onTap` is
--- given, a press-release without real movement fires it instead.
-local function makeDraggable(handle, target, onTap)
-	local dragging = false
-	local moved = false
-	local pressAt, startPos
-
-	handle.InputBegan:Connect(function(input)
-		if isPress(input) then
-			dragging = true
-			moved = false
-			pressAt = input.Position
-			startPos = target.Position
-		end
-	end)
-
-	trackConn(UserInputService.InputChanged:Connect(function(input)
-		if dragging and isMove(input) then
-			local delta = input.Position - pressAt
-			if delta.Magnitude > TAP_THRESHOLD then
-				moved = true
-			end
-			target.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + delta.X,
-				startPos.Y.Scale, startPos.Y.Offset + delta.Y
-			)
-		end
-	end))
-
-	trackConn(UserInputService.InputEnded:Connect(function(input)
-		if dragging and isPress(input) then
-			dragging = false
-			if onTap and not moved then
-				onTap()
-			end
-		end
-	end))
-end
-
--- Slider plumbing: a press on `hit` starts dragging and `apply(position)`
--- runs on every pointer move until release. Returns an isDragging() probe.
-local function makeSlider(hit, apply)
-	local dragging = false
-
-	hit.InputBegan:Connect(function(input)
-		if isPress(input) then
-			dragging = true
-			apply(input.Position)
-		end
-	end)
-
-	trackConn(UserInputService.InputChanged:Connect(function(input)
-		if dragging and isMove(input) then
-			apply(input.Position)
-		end
-	end))
-
-	trackConn(UserInputService.InputEnded:Connect(function(input)
-		if isPress(input) then
-			dragging = false
-		end
-	end))
-
-	return function()
-		return dragging
-	end
-end
-
 -- ================= Sound + root UI =================
 
 local sound = create("Sound", {
@@ -494,20 +256,20 @@ local floatBtn = create("ImageButton", {
 	Parent = screenGui,
 })
 corner(floatBtn)
-createIcon(floatBtn, 24, COLORS.white).set("musicNote", "♪")
+createIcon(floatBtn, 32, COLORS.white).set("musicNote", "♪")
 
 eyeBtn.MouseButton1Click:Connect(function()
 	bar.Visible = false
 	floatBtn.Visible = true
 end)
 
-makeDraggable(floatBtn, floatBtn, function()
+Lib.makeDraggable(floatBtn, floatBtn, function()
 	bar.Visible = true
 	floatBtn.Visible = false
 end)
 
 -- The bar background drags the whole widget; buttons consume their own input.
-makeDraggable(bar, bar)
+Lib.makeDraggable(bar, bar)
 
 -- ================= Progress bar =================
 
@@ -565,12 +327,12 @@ local function seekTo(rel)
 	end
 end
 
-local isSeeking = makeSlider(seekHit, function(pos)
+local isSeeking = Lib.makeSlider(seekHit, function(pos)
 	seekTo((pos.X - progressTrack.AbsolutePosition.X) / progressTrack.AbsoluteSize.X)
 end)
 
 -- Live progress while not dragging the knob.
-trackConn(RunService.RenderStepped:Connect(function()
+Lib.track(RunService.RenderStepped:Connect(function()
 	if not isSeeking() and sound.TimeLength > 0 then
 		setProgress(sound.TimePosition / sound.TimeLength)
 	end
@@ -742,7 +504,7 @@ local function applyVolume(rel)
 end
 
 -- Vertical mapping: top = 100%, bottom = 0%.
-makeSlider(volHit, function(pos)
+Lib.makeSlider(volHit, function(pos)
 	applyVolume(1 - (pos.Y - volTrack.AbsolutePosition.Y) / volTrack.AbsoluteSize.Y)
 end)
 
@@ -1172,13 +934,10 @@ setTab("all")
 setCurrent(musicTracks[currentIndex].id)
 setPlayGlyph()
 
--- Cleanup hook for the next run: kills service connections, sound and UI.
+-- Cleanup hook for the next run: kills Lib's service connections, the sound
+-- and the UI.
 _G.MusicTesterCleanup = function()
-	for _, conn in ipairs(uiConnections) do
-		pcall(function()
-			conn:Disconnect()
-		end)
-	end
+	pcall(Lib.cleanup)
 	pcall(function()
 		sound:Destroy()
 	end)
