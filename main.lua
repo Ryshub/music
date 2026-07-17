@@ -1,11 +1,3 @@
---[[
-	ryshub/music — compact, draggable music player for Roblox.
-	Components (downloaded from the repo):
-	  lib.lua    — shared UI / input / HTTP / icon helpers
-	  tracks.lua — the song list
-	Favorites persist to ryshub/music/favorites.json.
-]]
-
 local Players = game:GetService("Players")
 local SoundService = game:GetService("SoundService")
 local RunService = game:GetService("RunService")
